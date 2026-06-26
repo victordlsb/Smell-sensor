@@ -17,10 +17,23 @@ struct Config {
   char msgBad[140] = "Mal olor detectado ([valor])";
   char msgOk[140] = "Ya no huele mal ([valor])";
   char msgTest[140] = "Test sensor WC. Valor MQ135: [valor]";
-  int threshold = 350;
+  int thresholdOn = 350;
+  int thresholdOff = 320;
+  int movingAverageSamples = 10;
+  int confirmationSeconds = 5;
+  int samplingIntervalMs = 1000;
 };
 
 Config config;
+
+enum SensorState {
+  STATE_OK,
+  STATE_PENDING_BAD,
+  STATE_BAD,
+  STATE_PENDING_OK
+};
+
+SensorState sensorState = STATE_OK;
 
 bool malOlor = false;
 bool estadoInicializado = false;
@@ -31,6 +44,14 @@ bool longPressDone = false;
 
 unsigned long lastRead = 0;
 int lastValue = 0;
+
+const int MAX_AVG_SAMPLES = 60;
+int samples[MAX_AVG_SAMPLES];
+int sampleCount = 0;
+int sampleIndex = 0;
+long sampleSum = 0;
+int movingAverage = 0;
+unsigned long pendingSince = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -70,31 +91,118 @@ void loop() {
 }
 
 void handleSensor() {
-  if (millis() - lastRead < 1000) return;
+  if (millis() - lastRead < (unsigned long)config.samplingIntervalMs) return;
   lastRead = millis();
 
   lastValue = analogRead(MQ_PIN);
+  updateMovingAverage(lastValue);
 
   Serial.print("MQ135: ");
-  Serial.println(lastValue);
-
-  bool ahoraMalOlor = lastValue > config.threshold;
+  Serial.print(lastValue);
+  Serial.print(" | AVG: ");
+  Serial.print(movingAverage);
+  Serial.print(" | State: ");
+  Serial.println(sensorStateName());
 
   if (!estadoInicializado) {
-    malOlor = ahoraMalOlor;
+    malOlor = movingAverage > config.thresholdOn;
+    sensorState = malOlor ? STATE_BAD : STATE_OK;
     estadoInicializado = true;
     return;
   }
 
-  if (!malOlor && ahoraMalOlor) {
-    malOlor = true;
-    sendWebhook(renderMessage(config.msgBad, lastValue));
+  updateSensorState();
+}
+
+void updateMovingAverage(int value) {
+  int requestedSamples = constrain(config.movingAverageSamples, 1, MAX_AVG_SAMPLES);
+
+  if (sampleCount != requestedSamples && sampleCount > 0) {
+    resetMovingAverage();
   }
 
-  if (malOlor && !ahoraMalOlor) {
-    malOlor = false;
-    sendWebhook(renderMessage(config.msgOk, lastValue));
+  if (sampleCount < requestedSamples) {
+    samples[sampleIndex] = value;
+    sampleSum += value;
+    sampleCount++;
+    sampleIndex = (sampleIndex + 1) % requestedSamples;
+  } else {
+    sampleSum -= samples[sampleIndex];
+    samples[sampleIndex] = value;
+    sampleSum += value;
+    sampleIndex = (sampleIndex + 1) % requestedSamples;
   }
+
+  movingAverage = sampleSum / sampleCount;
+}
+
+void resetMovingAverage() {
+  sampleCount = 0;
+  sampleIndex = 0;
+  sampleSum = 0;
+  movingAverage = 0;
+}
+
+void updateSensorState() {
+  unsigned long now = millis();
+  unsigned long confirmationMs = (unsigned long)config.confirmationSeconds * 1000UL;
+
+  switch (sensorState) {
+    case STATE_OK:
+      malOlor = false;
+      if (movingAverage > config.thresholdOn) {
+        sensorState = STATE_PENDING_BAD;
+        pendingSince = now;
+      }
+      break;
+
+    case STATE_PENDING_BAD:
+      if (movingAverage <= config.thresholdOn) {
+        sensorState = STATE_OK;
+        pendingSince = 0;
+      } else if (now - pendingSince >= confirmationMs) {
+        sensorState = STATE_BAD;
+        malOlor = true;
+        pendingSince = 0;
+        sendWebhook(renderMessage(config.msgBad, lastValue));
+      }
+      break;
+
+    case STATE_BAD:
+      malOlor = true;
+      if (movingAverage < config.thresholdOff) {
+        sensorState = STATE_PENDING_OK;
+        pendingSince = now;
+      }
+      break;
+
+    case STATE_PENDING_OK:
+      if (movingAverage >= config.thresholdOff) {
+        sensorState = STATE_BAD;
+        pendingSince = 0;
+      } else if (now - pendingSince >= confirmationMs) {
+        sensorState = STATE_OK;
+        malOlor = false;
+        pendingSince = 0;
+        sendWebhook(renderMessage(config.msgOk, lastValue));
+      }
+      break;
+  }
+}
+
+String sensorStateName() {
+  switch (sensorState) {
+    case STATE_OK: return "OK";
+    case STATE_PENDING_BAD: return "PENDING_BAD";
+    case STATE_BAD: return "BAD";
+    case STATE_PENDING_OK: return "PENDING_OK";
+  }
+  return "UNKNOWN";
+}
+
+unsigned long pendingSeconds() {
+  if (pendingSince == 0) return 0;
+  return (millis() - pendingSince) / 1000UL;
 }
 
 void handleButton() {
@@ -129,6 +237,14 @@ void handleButton() {
 
 String renderMessage(String msg, int value) {
   msg.replace("[valor]", String(value));
+  msg.replace("[value]", String(value));
+  msg.replace("[average]", String(movingAverage));
+  msg.replace("[threshold_on]", String(config.thresholdOn));
+  msg.replace("[threshold_off]", String(config.thresholdOff));
+  msg.replace("[state]", sensorStateName());
+  msg.replace("[ip]", WiFi.localIP().toString());
+  msg.replace("[hostname]", "wc-sensor");
+  msg.replace("[uptime]", String(millis() / 1000UL));
   return msg;
 }
 
@@ -148,9 +264,15 @@ void handleRoot() {
   html += "<style>body{font-family:Arial;margin:24px;}input,textarea{width:100%;padding:8px;margin:6px 0;}button{padding:10px 14px;margin:6px 0;}</style>";
   html += "</head><body>";
   html += "<h2>Sensor WC</h2>";
-  html += "<p><b>Valor:</b> " + String(lastValue) + "</p>";
-  html += "<p><b>Umbral:</b> " + String(config.threshold) + "</p>";
-  html += "<p><b>Estado:</b> " + String(malOlor ? "MAL OLOR" : "OK") + "</p>";
+  html += "<p><b>Valor actual:</b> " + String(lastValue) + "</p>";
+  html += "<p><b>Media movil:</b> " + String(movingAverage) + "</p>";
+  html += "<p><b>Umbral ON:</b> " + String(config.thresholdOn) + "</p>";
+  html += "<p><b>Umbral OFF:</b> " + String(config.thresholdOff) + "</p>";
+  html += "<p><b>Estado:</b> " + sensorStateName() + "</p>";
+  html += "<p><b>Tiempo candidato:</b> " + String(pendingSeconds()) + "s</p>";
+  html += "<p><b>Muestras media:</b> " + String(config.movingAverageSamples) + "</p>";
+  html += "<p><b>Confirmacion:</b> " + String(config.confirmationSeconds) + "s</p>";
+  html += "<p><b>Intervalo lectura:</b> " + String(config.samplingIntervalMs) + "ms</p>";
   html += "<p><a href='/config'><button>Configurar</button></a></p>";
   html += "<p><a href='/test'><button>Enviar test</button></a></p>";
   html += "<p><a href='/status'>Ver JSON</a></p>";
@@ -170,8 +292,20 @@ void handleConfigPage() {
   html += "Endpoint:<br>";
   html += "<input name='endpoint' value='" + String(config.endpoint) + "'>";
 
-  html += "Umbral:<br>";
-  html += "<input name='threshold' type='number' value='" + String(config.threshold) + "'>";
+  html += "Umbral ON - pasa a mal olor si la media supera este valor:<br>";
+  html += "<input name='thresholdOn' type='number' value='" + String(config.thresholdOn) + "'>";
+
+  html += "Umbral OFF - vuelve a OK si la media baja de este valor:<br>";
+  html += "<input name='thresholdOff' type='number' value='" + String(config.thresholdOff) + "'>";
+
+  html += "Muestras de media movil - 1 a 60:<br>";
+  html += "<input name='movingAverageSamples' type='number' min='1' max='60' value='" + String(config.movingAverageSamples) + "'>";
+
+  html += "Tiempo de confirmacion en segundos:<br>";
+  html += "<input name='confirmationSeconds' type='number' min='0' value='" + String(config.confirmationSeconds) + "'>";
+
+  html += "Intervalo de lectura en ms:<br>";
+  html += "<input name='samplingIntervalMs' type='number' min='200' value='" + String(config.samplingIntervalMs) + "'>";
 
   html += "Mensaje mal olor:<br>";
   html += "<textarea name='msgBad'>" + String(config.msgBad) + "</textarea>";
@@ -182,7 +316,7 @@ void handleConfigPage() {
   html += "Mensaje test:<br>";
   html += "<textarea name='msgTest'>" + String(config.msgTest) + "</textarea>";
 
-  html += "<p>Usa <b>[valor]</b> para insertar el valor del sensor.</p>";
+  html += "<p>Variables disponibles: <b>[valor]</b>, <b>[value]</b>, <b>[average]</b>, <b>[threshold_on]</b>, <b>[threshold_off]</b>, <b>[state]</b>, <b>[ip]</b>, <b>[hostname]</b>, <b>[uptime]</b>.</p>";
   html += "<button type='submit'>Guardar</button>";
   html += "</form>";
   html += "<p><a href='/'>Volver</a></p>";
@@ -196,7 +330,19 @@ void handleSaveConfig() {
   strlcpy(config.msgBad, server.arg("msgBad").c_str(), sizeof(config.msgBad));
   strlcpy(config.msgOk, server.arg("msgOk").c_str(), sizeof(config.msgOk));
   strlcpy(config.msgTest, server.arg("msgTest").c_str(), sizeof(config.msgTest));
-  config.threshold = server.arg("threshold").toInt();
+  config.thresholdOn = server.arg("thresholdOn").toInt();
+  config.thresholdOff = server.arg("thresholdOff").toInt();
+  config.movingAverageSamples = constrain(server.arg("movingAverageSamples").toInt(), 1, MAX_AVG_SAMPLES);
+  config.confirmationSeconds = max(0, server.arg("confirmationSeconds").toInt());
+  config.samplingIntervalMs = max(200, server.arg("samplingIntervalMs").toInt());
+
+  if (config.thresholdOff >= config.thresholdOn) {
+    config.thresholdOff = config.thresholdOn - 1;
+  }
+
+  resetMovingAverage();
+  estadoInicializado = false;
+  pendingSince = 0;
 
   saveConfig();
 
@@ -205,13 +351,22 @@ void handleSaveConfig() {
 }
 
 void handleStatus() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
 
   doc["value"] = lastValue;
-  doc["threshold"] = config.threshold;
+  doc["average"] = movingAverage;
+  doc["threshold_on"] = config.thresholdOn;
+  doc["threshold_off"] = config.thresholdOff;
+  doc["moving_average_samples"] = config.movingAverageSamples;
+  doc["confirmation_seconds"] = config.confirmationSeconds;
+  doc["sampling_interval_ms"] = config.samplingIntervalMs;
   doc["bad_smell"] = malOlor;
+  doc["state"] = sensorStateName();
+  doc["pending_seconds"] = pendingSeconds();
   doc["endpoint"] = config.endpoint;
   doc["ip"] = WiFi.localIP().toString();
+  doc["hostname"] = "wc-sensor";
+  doc["uptime"] = millis() / 1000UL;
 
   String json;
   serializeJson(doc, json);
@@ -221,6 +376,7 @@ void handleStatus() {
 
 void handleTest() {
   int value = analogRead(MQ_PIN);
+  updateMovingAverage(value);
   sendWebhook(renderMessage(config.msgTest, value));
 
   server.sendHeader("Location", "/");
@@ -275,7 +431,7 @@ void loadConfig() {
   File file = LittleFS.open("/config.json", "r");
   if (!file) return;
 
-  StaticJsonDocument<700> doc;
+  StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
@@ -285,14 +441,26 @@ void loadConfig() {
   strlcpy(config.msgBad, doc["msgBad"] | config.msgBad, sizeof(config.msgBad));
   strlcpy(config.msgOk, doc["msgOk"] | config.msgOk, sizeof(config.msgOk));
   strlcpy(config.msgTest, doc["msgTest"] | config.msgTest, sizeof(config.msgTest));
-  config.threshold = doc["threshold"] | config.threshold;
+  config.thresholdOn = doc["thresholdOn"] | doc["threshold_on"] | doc["threshold"] | config.thresholdOn;
+  config.thresholdOff = doc["thresholdOff"] | doc["threshold_off"] | config.thresholdOff;
+  config.movingAverageSamples = constrain((int)(doc["movingAverageSamples"] | doc["moving_average_samples"] | config.movingAverageSamples), 1, MAX_AVG_SAMPLES);
+  config.confirmationSeconds = max(0, (int)(doc["confirmationSeconds"] | doc["confirmation_seconds"] | config.confirmationSeconds));
+  config.samplingIntervalMs = max(200, (int)(doc["samplingIntervalMs"] | doc["sampling_interval_ms"] | config.samplingIntervalMs));
+
+  if (config.thresholdOff >= config.thresholdOn) {
+    config.thresholdOff = config.thresholdOn - 1;
+  }
 }
 
 void saveConfig() {
-  StaticJsonDocument<700> doc;
+  StaticJsonDocument<1024> doc;
 
   doc["endpoint"] = config.endpoint;
-  doc["threshold"] = config.threshold;
+  doc["thresholdOn"] = config.thresholdOn;
+  doc["thresholdOff"] = config.thresholdOff;
+  doc["movingAverageSamples"] = config.movingAverageSamples;
+  doc["confirmationSeconds"] = config.confirmationSeconds;
+  doc["samplingIntervalMs"] = config.samplingIntervalMs;
   doc["msgBad"] = config.msgBad;
   doc["msgOk"] = config.msgOk;
   doc["msgTest"] = config.msgTest;
